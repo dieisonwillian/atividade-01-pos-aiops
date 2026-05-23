@@ -1,0 +1,111 @@
+# =============================================================================
+# k8s-secret.yaml
+# Cria o Secret com DATABASE_URL e API_KEY codificados em base64
+#
+# Para gerar os valores:
+#   echo -n "postgresql://user:pass@host:5432/db" | base64
+#   echo -n "minha-api-key-secreta"               | base64
+# =============================================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: lift-secrets
+  namespace: default
+type: Opaque
+data:
+  DATABASE_URL: <base64-encoded-value>   # substitua pelo valor real
+  API_KEY:      <base64-encoded-value>   # substitua pelo valor real
+
+---
+# =============================================================================
+# k8s-deployment.yaml
+# Deployment que injeta os Secrets como variáveis de ambiente no container
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lift-app
+  labels:
+    app: lift
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: lift
+  template:
+    metadata:
+      labels:
+        app: lift
+    spec:
+      # Impede escalonamento do pod como root
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+
+      containers:
+        - name: lift
+          image: your-registry/lift:latest   # substitua pela sua imagem
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+
+          # Injeta DATABASE_URL e API_KEY a partir do Secret
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: lift-secrets
+                  key: DATABASE_URL
+            - name: API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: lift-secrets
+                  key: API_KEY
+            - name: PORT
+              value: "8000"
+            - name: WORKERS
+              value: "2"
+
+          # Liveness: reinicia o pod se a app travar
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+
+          # Readiness: remove o pod do balanceador enquanto não estiver pronto
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+
+---
+# =============================================================================
+# k8s-service.yaml
+# Expõe o Deployment internamente no cluster
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: lift-service
+spec:
+  selector:
+    app: lift
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8000
+  type: ClusterIP

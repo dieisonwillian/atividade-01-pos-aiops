@@ -1,0 +1,632 @@
+# ============================================================================
+# MANIFESTO KUBERNETES - CHRONOS API
+# Versão: 1.0.0
+# Descrição: Deployment com boas práticas de segurança e infraestrutura
+# ============================================================================
+
+---
+# NAMESPACE - Isolamento de recursos
+# Recomendação: Separar por ambiente (dev, staging, production)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: chronos-production
+  labels:
+    environment: production
+    managed-by: terraform
+
+---
+# SECRET - Gerenciamento de credenciais
+# IMPORTANTE: Usar ferramentas como Sealed Secrets, Vault ou SOPS para gerenciar
+# Neste exemplo, substitua os valores base64 por valores reais
+# Comando para gerar: echo -n "seu-valor" | base64
+apiVersion: v1
+kind: Secret
+metadata:
+  name: chronos-api-secrets
+  namespace: chronos-production
+  labels:
+    app: chronos-api
+type: Opaque
+data:
+  # Substitua pelos valores reais (base64 encoded)
+  db-password: UGFzc3cwcmQyMDIzIQ==          # TODO: Use secret management tool
+  jwt-secret: aHZ0LWp3dC1wcm9kLXNlY3JldA==  # TODO: Use secret management tool
+  db-connection-string: ""                    # TODO: Adicionar connection string
+
+---
+# CONFIGMAP - Configurações não-sensíveis
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: chronos-api-config
+  namespace: chronos-production
+  labels:
+    app: chronos-api
+data:
+  # Configurações de aplicação
+  LOG_LEVEL: "INFO"
+  ENVIRONMENT: "production"
+  API_VERSION: "v1"
+  
+  # Configurações de timeout
+  REQUEST_TIMEOUT: "30s"
+  SHUTDOWN_TIMEOUT: "15s"
+  
+  # Métricas e observabilidade
+  METRICS_ENABLED: "true"
+  METRICS_PORT: "9090"
+
+---
+# SERVICE ACCOUNT - Controle de acesso (RBAC)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: chronos-api
+  namespace: chronos-production
+  labels:
+    app: chronos-api
+
+---
+# ROLE - Permissões mínimas necessárias
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: chronos-api
+  namespace: chronos-production
+  labels:
+    app: chronos-api
+rules:
+  # Apenas leitura de ConfigMaps da aplicação
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["chronos-api-config"]
+    verbs: ["get", "list", "watch"]
+  
+  # Apenas leitura de Secrets da aplicação
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["chronos-api-secrets"]
+    verbs: ["get"]
+
+---
+# ROLE BINDING - Vincula Role ao ServiceAccount
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: chronos-api
+  namespace: chronos-production
+  labels:
+    app: chronos-api
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: chronos-api
+subjects:
+  - kind: ServiceAccount
+    name: chronos-api
+    namespace: chronos-production
+
+---
+# NETWORK POLICY - Isolamento de rede
+# Restringe tráfego de entrada/saída
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: chronos-api
+  namespace: chronos-production
+  labels:
+    app: chronos-api
+spec:
+  podSelector:
+    matchLabels:
+      app: chronos-api
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Permite tráfego do Ingress Controller
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8080
+    
+    # Permite tráfego de health checks do Kubernetes
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8080
+  
+  egress:
+    # Permite DNS (necessário para resolver nomes)
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+    
+    # Permite tráfego para banco de dados (ajuste para seu ambiente)
+    - to:
+        - podSelector:
+            matchLabels:
+              app: mongodb
+      ports:
+        - protocol: TCP
+          port: 27017
+    
+    # Permite tráfego para APIs externas (HTTPS)
+    - to:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 443
+
+---
+# DEPLOYMENT - Orquestração de containers
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chronos-api
+  namespace: chronos-production
+  labels:
+    app: chronos-api
+    version: v1
+  annotations:
+    description: "API Chronos com boas práticas de segurança"
+    contact: "devops@example.com"
+
+spec:
+  # Replicação para alta disponibilidade
+  replicas: 3
+  
+  # Estratégia de atualização: Rolling Update
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1        # Uma réplica extra durante update
+      maxUnavailable: 0  # Sem downtime
+  
+  # Seletor de pods
+  selector:
+    matchLabels:
+      app: chronos-api
+  
+  # Template do Pod
+  template:
+    metadata:
+      labels:
+        app: chronos-api
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    
+    spec:
+      # Service Account com permissões mínimas
+      serviceAccountName: chronos-api
+      
+      # Segurança no nível do Pod
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 2000
+        seccompProfile:
+          type: RuntimeDefault
+      
+      # Tolerâncias para node maintenance
+      tolerations:
+        - key: "node.kubernetes.io/not-ready"
+          operator: "Exists"
+          effect: "NoExecute"
+          tolerationSeconds: 300
+        - key: "node.kubernetes.io/unreachable"
+          operator: "Exists"
+          effect: "NoExecute"
+          tolerationSeconds: 300
+      
+      # Afinidade para distribuição de pods
+      affinity:
+        # Anti-afinidade: pods em nodes diferentes
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - chronos-api
+                topologyKey: kubernetes.io/hostname
+        
+        # Afinidade com nodes em zona específica
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 50
+              preference:
+                matchExpressions:
+                  - key: workload-type
+                    operator: In
+                    values:
+                      - production
+      
+      # Tempo de espera antes de forçar terminar o pod
+      terminationGracePeriodSeconds: 30
+      
+      # Containers
+      containers:
+      - name: api
+        
+        # Imagem com tag específica (NUNCA use 'latest' em produção)
+        image: chronos-api:v1.2.3
+        imagePullPolicy: IfNotPresent
+        
+        # Portas expostas
+        ports:
+          - name: http
+            containerPort: 8080
+            protocol: TCP
+          - name: metrics
+            containerPort: 9090
+            protocol: TCP
+        
+        # Variáveis de ambiente
+        env:
+          # Valores do ConfigMap (não-sensíveis)
+          - name: LOG_LEVEL
+            valueFrom:
+              configMapKeyRef:
+                name: chronos-api-config
+                key: LOG_LEVEL
+          
+          - name: ENVIRONMENT
+            valueFrom:
+              configMapKeyRef:
+                name: chronos-api-config
+                key: ENVIRONMENT
+          
+          # Valores do Secret (sensíveis)
+          - name: DB_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: chronos-api-secrets
+                key: db-password
+          
+          - name: JWT_SECRET
+            valueFrom:
+              secretKeyRef:
+                name: chronos-api-secrets
+                key: jwt-secret
+          
+          - name: DB_CONNECTION_STRING
+            valueFrom:
+              secretKeyRef:
+                name: chronos-api-secrets
+                key: db-connection-string
+          
+          # Informações do Pod (metadata)
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          
+          - name: POD_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+          
+          - name: POD_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+        
+        # Health Checks
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: http
+            scheme: HTTP
+          initialDelaySeconds: 30      # Aguarda 30s antes de checar
+          periodSeconds: 10            # Checa a cada 10s
+          timeoutSeconds: 5            # Timeout de 5s
+          failureThreshold: 3          # Falha após 3 tentativas
+          successThreshold: 1          # Sucesso após 1 tentativa
+        
+        # Readiness Probe - Disponibilidade para tráfego
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: http
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 2
+          successThreshold: 1
+        
+        # Startup Probe - Para aplicações com boot lento
+        startupProbe:
+          httpGet:
+            path: /health/startup
+            port: http
+            scheme: HTTP
+          initialDelaySeconds: 0
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 30        # 30 * 10s = 5 minutos para startup
+        
+        # Recursos: Requests e Limits
+        resources:
+          requests:
+            # Recursos garantidos
+            cpu: "500m"           # 0.5 vCPU
+            memory: "512Mi"       # 512 MB
+          limits:
+            # Limites máximos
+            cpu: "2000m"          # 2 vCPU
+            memory: "2Gi"         # 2 GB
+        
+        # Segurança do Container
+        securityContext:
+          allowPrivilegeEscalation: false
+          privileged: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 1000
+          capabilities:
+            drop:
+              - ALL
+            add:
+              - NET_BIND_SERVICE
+        
+        # Volumes de armazenamento
+        volumeMounts:
+          # Diretório temporário (ephemeral)
+          - name: tmp
+            mountPath: /tmp
+          - name: var-cache
+            mountPath: /var/cache
+          - name: var-run
+            mountPath: /var/run
+      
+      # Volumes do Pod
+      volumes:
+        # EmptyDir para arquivos temporários
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 100Mi
+        
+        - name: var-cache
+          emptyDir:
+            sizeLimit: 500Mi
+        
+        - name: var-run
+          emptyDir:
+            sizeLimit: 100Mi
+      
+      # Image Pull Secrets (se usando registro privado)
+      # imagePullSecrets:
+      #   - name: registry-credentials
+      
+      # DNS Policy
+      dnsPolicy: ClusterFirst
+      
+      # Restart Policy
+      restartPolicy: Always
+
+---
+# SERVICE - Expõe a aplicação
+apiVersion: v1
+kind: Service
+metadata:
+  name: chronos-api
+  namespace: chronos-production
+  labels:
+    app: chronos-api
+  annotations:
+    description: "Service para acesso à API Chronos"
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+      protocol: TCP
+  selector:
+    app: chronos-api
+  sessionAffinity: None
+
+---
+# HORIZONTAL POD AUTOSCALER - Auto-scaling
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: chronos-api
+  namespace: chronos-production
+  labels:
+    app: chronos-api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: chronos-api
+  
+  minReplicas: 3
+  maxReplicas: 10
+  
+  metrics:
+    # Baseado em CPU
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    
+    # Baseado em Memória
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 15
+    
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 15
+        - type: Pods
+          value: 2
+          periodSeconds: 15
+      selectPolicy: Max
+
+---
+# POD DISRUPTION BUDGET - Alta disponibilidade durante manutenção
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: chronos-api
+  namespace: chronos-production
+  labels:
+    app: chronos-api
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: chronos-api
+
+---
+# INGRESS - Acesso externo com TLS
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: chronos-api
+  namespace: chronos-production
+  labels:
+    app: chronos-api
+  annotations:
+    # Nginx Ingress Controller
+    kubernetes.io/ingress.class: "nginx"
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    
+    # SSL/TLS
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    
+    # Segurança
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/ssl-protocols: "TLSv1.2 TLSv1.3"
+    nginx.ingress.kubernetes.io/hsts: "true"
+    nginx.ingress.kubernetes.io/hsts-max-age: "31536000"
+    
+    # Rate limiting
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+    nginx.ingress.kubernetes.io/limit-connections: "10"
+    
+    # CORS
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-origin: "*"
+    
+    # Timeouts
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "30"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "30"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
+
+spec:
+  tls:
+    - hosts:
+        - chronos-api.example.com
+      secretName: chronos-api-tls
+  
+  rules:
+    - host: chronos-api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: chronos-api
+                port:
+                  number: 80
+
+---
+# RESOURCE QUOTA - Limita recursos por namespace
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: chronos-production
+  namespace: chronos-production
+spec:
+  hard:
+    requests.cpu: "10"           # 10 vCPUs
+    requests.memory: "20Gi"      # 20 GB
+    limits.cpu: "20"             # 20 vCPUs
+    limits.memory: "40Gi"        # 40 GB
+    pods: "50"                   # Máximo de 50 pods
+    services: "10"
+    persistentvolumeclaims: "5"
+
+---
+# NETWORK POLICY - Deny all (default)
+# Aplicar como padrão para maior segurança
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: chronos-production
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+
+# ============================================================================
+# CHECKLIST DE SEGURANÇA E INFRAESTRUTURA
+# ============================================================================
+# ✅ Credenciais: Gerenciadas via Secrets (use Sealed Secrets/Vault em produção)
+# ✅ Versionamento: Imagem com tag específica (não use 'latest')
+# ✅ Recursos: Requests e Limits definidos
+# ✅ Health Checks: Liveness, Readiness e Startup Probes
+# ✅ Segurança: Security Context restritivo
+# ✅ RBAC: Service Account com permissões mínimas
+# ✅ Rede: Network Policies para isolamento
+# ✅ HA: 3 replicas com anti-afinidade
+# ✅ Escalabilidade: HPA configurado
+# ✅ Observabilidade: Endpoints de métricas e health
+# ✅ Ingress: TLS/HTTPS com rate limiting
+# ✅ Pod Disruption Budget: Manutenção segura
+# ✅ Namespacing: Isolamento lógico
+# ✅ Resource Quotas: Controle de recursos
+# ✅ Logging: Endpoints preparados para coleta
+# 
+# PRÓXIMOS PASSOS:
+# 1. Implementar Sealed Secrets para gerenciar credenciais
+# 2. Configurar Prometheus para coleta de métricas
+# 3. Implementar Central Logging (ELK, Splunk, etc)
+# 4. Configurar Backup e Disaster Recovery
+# 5. Implementar Service Mesh (Istio/Linkerd) para observabilidade avançada
+# 6. Definir SLA e alertas no Alertmanager
+# 7. Realizar testes de carga e stress
+# 8. Implementar GitOps (ArgoCD, Flux) para deployment
+# ============================================================================

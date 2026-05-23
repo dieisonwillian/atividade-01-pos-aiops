@@ -1,0 +1,157 @@
+#!/bin/bash
+################################################################################
+# Arquivo de Exemplo: Configuração do PostgreSQL Backup
+# 
+# INSTRUÇÕES:
+# 1. Copie este arquivo para ~/.postgres-backup-config
+# 2. Ajuste os valores conforme seu ambiente
+# 3. Source o arquivo antes de executar o script:
+#    source ~/.postgres-backup-config
+#    /usr/local/bin/postgres-backup-s3.sh
+################################################################################
+
+# ============================================================================
+# CONFIGURAÇÃO POSTGRESQL
+# ============================================================================
+
+# Nome do banco de dados a fazer backup
+export DB_NAME="ledger"
+
+# Usuário PostgreSQL (deve ter permissão de backup)
+export DB_USER="postgres"
+
+# Host do PostgreSQL
+export DB_HOST="localhost"
+
+# Porta do PostgreSQL
+export DB_PORT="5432"
+
+# Senha do PostgreSQL (opcional - use .pgpass para maior segurança)
+# export DB_PASSWORD="sua_senha_aqui"
+
+# ============================================================================
+# CONFIGURAÇÃO AWS S3
+# ============================================================================
+
+# Nome do bucket S3 (deve já existir)
+# Nota: configurar no script como S3_BUCKET
+# export S3_BUCKET="hvt-ledger-backups"
+
+# Região AWS
+export AWS_REGION="us-east-1"
+
+# Perfil AWS CLI (se usar múltiplos perfis)
+# export AWS_PROFILE="default"
+
+# ============================================================================
+# CONFIGURAÇÃO DE RETENÇÃO
+# ============================================================================
+
+# Número de dias para manter backups antigos
+# Arquivos mais antigos serão deletados automaticamente
+# export RETENTION_DAYS="30"
+
+# ============================================================================
+# CONFIGURAÇÃO DE DIRETÓRIOS
+# ============================================================================
+
+# Diretório local para armazenar backups temporários
+# export BACKUP_DIR="/var/backups/ledger"
+
+# Arquivo de log para registrar todas as operações
+# export LOG_FILE="/var/log/ledger-backup.log"
+
+# ============================================================================
+# CONFIGURAÇÃO DE AUTENTICAÇÃO AWS
+# ============================================================================
+
+# Opção 1: Usar arquivo ~/.aws/credentials (recomendado)
+# Execute: aws configure
+# ou use variáveis abaixo
+
+# Chave de acesso AWS
+# export AWS_ACCESS_KEY_ID="sua-chave-aqui"
+
+# Chave secreta AWS
+# export AWS_SECRET_ACCESS_KEY="sua-secret-aqui"
+
+# Opção 2: Usar perfil nomeado do AWS CLI
+# export AWS_PROFILE="seu-perfil"
+
+# ============================================================================
+# CONFIGURAÇÃO DE AUTENTICAÇÃO POSTGRESQL
+# ============================================================================
+
+# Opção 1: Usar arquivo ~/.pgpass (RECOMENDADO - MAIS SEGURO)
+# Crie o arquivo:
+# echo "localhost:5432:ledger:postgres:sua_senha" > ~/.pgpass
+# chmod 600 ~/.pgpass
+
+# Opção 2: Usar variável de ambiente (menos seguro)
+# export DB_PASSWORD="sua_senha_aqui"
+
+# Opção 3: Deixar em branco se usar .pgpass ou trust authentication
+
+# ============================================================================
+# CONFIGURAÇÕES AVANÇADAS
+# ============================================================================
+
+# Timeout de conexão PostgreSQL (segundos)
+# export PGCONNECT_TIMEOUT="30"
+
+# Formato de dump (p=plain, c=custom, d=directory, t=tar)
+# export DUMP_FORMAT="p"
+
+# Nível de compressão gzip (1-9, default=6)
+# Nota: Adicionar ao script se necessário
+# export GZIP_LEVEL="9"
+
+# ============================================================================
+# EXEMPLOS DE USO
+# ============================================================================
+
+# 1. Usar este arquivo como configuração
+# source ~/.postgres-backup-config
+# /usr/local/bin/postgres-backup-s3.sh
+
+# 2. Sobrescrever uma variável
+# source ~/.postgres-backup-config
+# DB_NAME="outro_db" /usr/local/bin/postgres-backup-s3.sh
+
+# 3. Agendar no cron com arquivo de configuração
+# crontab -e
+# 0 2 * * * source /root/.postgres-backup-config && /usr/local/bin/postgres-backup-s3.sh
+
+# ============================================================================
+# VARIÁVEIS DE DIAGNÓSTICO (descomente para debug)
+# ============================================================================
+
+# Mostrar comandos executados
+# set -x
+
+# Exit on error
+# set -e
+
+# ============================================================================
+# VALIDAÇÃO (descomente para testar configuração)
+# ============================================================================
+
+# Descomentar para testar configuração
+if [[ "${VALIDATE_CONFIG:-0}" == "1" ]]; then
+    echo "Validando configuração..."
+    echo "DB_NAME: $DB_NAME"
+    echo "DB_USER: $DB_USER"
+    echo "DB_HOST: $DB_HOST"
+    echo "DB_PORT: $DB_PORT"
+    echo "AWS_REGION: $AWS_REGION"
+    echo "BACKUP_DIR: ${BACKUP_DIR:-/var/backups/ledger}"
+    echo "LOG_FILE: ${LOG_FILE:-/var/log/ledger-backup.log}"
+    
+    # Testar conexão PostgreSQL
+    echo -e "\nTestando PostgreSQL..."
+    PGPASSWORD="${DB_PASSWORD:-}" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "postgres" -c "SELECT version();"
+    
+    # Testar AWS
+    echo -e "\nTestando AWS..."
+    aws sts get-caller-identity
+fi
