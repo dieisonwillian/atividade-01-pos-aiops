@@ -54,7 +54,7 @@ Crie um modelo terraform para criação de buckets S3 que será utilizado por to
  - Prefixo hvt- nos nomes de recursos.
  - Todo bucket S3 com: encryption habilitada (SSE-S3 mínimo), versioning ativo, block public access total, logging configurado.
 
-Retone apenas o arquivo.tf com comentarios indicando as informações que devem ser preenchidas/substituidas.
+Retone apenas o arquivo.tf com comentarios indicando as informações que devem ser preenchidas/substituidas e um exemplo de uso.
 
 Siga o padrão utilizado no modulo de VPC abaixo:
 
@@ -80,168 +80,16 @@ resource "aws_vpc" "this" {
 
 ## Saida do Prompt (Chat)
 
-```hcl
-# =============================================================================
-# Módulo Terraform - S3 Bucket (Padrão Interno HVT)
-# =============================================================================
-# Este módulo cria buckets S3 seguindo o padrão de compliance interno:
-# - Tags obrigatórias: Owner, CostCenter, Environment
-# - Prefixo hvt- em todos os recursos
-# - Encryption SSE-S3 (mínimo) habilitada
-# - Versioning ativo
-# - Block public access total
-# - Logging configurado
-# =============================================================================
+Pronto. O módulo segue o mesmo estilo do seu VPC (`variable` com `description` em PT, `locals.common_tags` via `merge`, recurso nomeado `this` com prefixo `hvt-` e sufixo de ambiente).
 
+Pontos de atenção do que precisa ser preenchido/decidido pelos times:
 
-# -----------------------------------------------------------------------------
-# Variáveis
-# -----------------------------------------------------------------------------
+- **`owner`, `cost_center`, `logging_target_bucket`** são obrigatórios sem default — marcados com `>>> PREENCHER <<<` nos comentários.
+- **AWS Provider v4+** é exigido: a partir dessa versão versioning/encryption/logging são recursos separados (por isso o bloco `terraform { required_providers }`). Se algum time ainda usa provider v3, o módulo não aplica.
+- **Logging tem uma dependência externa:** o `logging_target_bucket` precisa de uma bucket policy de entrega de logs já configurada. Isso é responsabilidade do bucket de logging centralizado, não deste módulo — deixei um comentário no recurso explicando.
+- **SSE-S3 é o default** (`AES256`), cumprindo o mínimo. Deixei `sse_algorithm`/`kms_key_id` opcionais para quem quiser subir para SSE-KMS sem quebrar o padrão.
 
-variable "environment" {
-  description = "Nome do ambiente (dev, staging, production)"
-  type        = string
-  # PREENCHER: informar o ambiente alvo (ex: "dev", "staging", "production")
-}
-
-variable "owner" {
-  description = "Responsável pelo recurso (time ou e-mail)"
-  type        = string
-  # PREENCHER: nome do time ou e-mail responsável (ex: "team-data@hvt.com")
-}
-
-variable "cost_center" {
-  description = "Centro de custo para billing"
-  type        = string
-  # PREENCHER: identificador do centro de custo (ex: "CC-1234")
-}
-
-variable "bucket_name" {
-  description = "Nome do bucket (será prefixado automaticamente com 'hvt-')"
-  type        = string
-  # PREENCHER: sufixo do nome do bucket (ex: "app-logs", "data-lake")
-  # Resultado final: hvt-<bucket_name>-<environment>
-}
-
-variable "logging_target_bucket" {
-  description = "Nome do bucket de destino para armazenamento dos logs de acesso"
-  type        = string
-  # PREENCHER: nome do bucket que receberá os logs (deve existir previamente)
-  # Recomenda-se um bucket centralizado de logs (ex: "hvt-access-logs-prod")
-}
-
-variable "logging_target_prefix" {
-  description = "Prefixo das chaves de log dentro do bucket de destino"
-  type        = string
-  default     = "s3-access-logs/"
-  # OPCIONAL: alterar caso queira organizar logs em outro caminho
-}
-
-
-# -----------------------------------------------------------------------------
-# Locals
-# -----------------------------------------------------------------------------
-
-locals {
-  common_tags = {
-    Owner       = var.owner
-    CostCenter  = var.cost_center
-    Environment = var.environment
-  }
-
-  bucket_full_name = "hvt-${var.bucket_name}-${var.environment}"
-}
-
-
-# -----------------------------------------------------------------------------
-# Bucket S3
-# -----------------------------------------------------------------------------
-
-resource "aws_s3_bucket" "this" {
-  bucket = local.bucket_full_name
-
-  tags = merge(local.common_tags, {
-    Name = local.bucket_full_name
-  })
-}
-
-
-# -----------------------------------------------------------------------------
-# Versioning (obrigatório: ativo)
-# -----------------------------------------------------------------------------
-
-resource "aws_s3_bucket_versioning" "this" {
-  bucket = aws_s3_bucket.this.id
-
-  versioning_configuration {
-    status = "Enabled"
-  }
-}
-
-
-# -----------------------------------------------------------------------------
-# Server-Side Encryption (obrigatório: SSE-S3 mínimo)
-# -----------------------------------------------------------------------------
-
-resource "aws_s3_bucket_server_side_encryption_configuration" "this" {
-  bucket = aws_s3_bucket.this.id
-
-  rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
-      # ALTERAR para "aws:kms" caso o time precise utilizar SSE-KMS
-      # Nesse caso, adicionar também: kms_master_key_id = "<arn-da-chave-kms>"
-    }
-    bucket_key_enabled = true
-  }
-}
-
-
-# -----------------------------------------------------------------------------
-# Block Public Access (obrigatório: bloqueio total)
-# -----------------------------------------------------------------------------
-
-resource "aws_s3_bucket_public_access_block" "this" {
-  bucket = aws_s3_bucket.this.id
-
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
-
-# -----------------------------------------------------------------------------
-# Logging (obrigatório: configurado)
-# -----------------------------------------------------------------------------
-
-resource "aws_s3_bucket_logging" "this" {
-  bucket = aws_s3_bucket.this.id
-
-  target_bucket = var.logging_target_bucket
-  target_prefix = "${var.logging_target_prefix}${local.bucket_full_name}/"
-}
-
-
-# -----------------------------------------------------------------------------
-# Outputs
-# -----------------------------------------------------------------------------
-
-output "bucket_id" {
-  description = "ID (nome) do bucket S3 criado"
-  value       = aws_s3_bucket.this.id
-}
-
-output "bucket_arn" {
-  description = "ARN do bucket S3 criado"
-  value       = aws_s3_bucket.this.arn
-}
-
-output "bucket_domain_name" {
-  description = "Domínio do bucket S3"
-  value       = aws_s3_bucket.this.bucket_domain_name
-}
-```
+Se quiser, posso quebrar isso em `variables.tf` / `main.tf` / `outputs.tf` separados, ou adicionar uma regra de lifecycle/retention nas versões antigas.
 
 ## Resultados
 
