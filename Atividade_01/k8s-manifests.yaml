@@ -48,7 +48,7 @@ spec:
           image: your-registry/lift:latest   # substitua pela sua imagem
           imagePullPolicy: Always
           ports:
-            - containerPort: 8000
+            - containerPort: 8080
 
           # Injeta DATABASE_URL e API_KEY a partir do Secret
           env:
@@ -63,7 +63,7 @@ spec:
                   name: lift-secrets
                   key: API_KEY
             - name: PORT
-              value: "8000"
+              value: "8080"
             - name: WORKERS
               value: "2"
 
@@ -71,7 +71,7 @@ spec:
           livenessProbe:
             httpGet:
               path: /health
-              port: 8000
+              port: 8080
             initialDelaySeconds: 15
             periodSeconds: 20
             failureThreshold: 3
@@ -80,7 +80,7 @@ spec:
           readinessProbe:
             httpGet:
               path: /health
-              port: 8000
+              port: 8080
             initialDelaySeconds: 5
             periodSeconds: 10
 
@@ -107,5 +107,5 @@ spec:
   ports:
     - protocol: TCP
       port: 80
-      targetPort: 8000
+      targetPort: 8080
   type: ClusterIP

@@ -35,7 +35,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     #   - secretKeyRef  (recomendado para credenciais)
     #   - configMapKeyRef (para configs não-sensíveis)
     # Exemplo de Secret manifest no README abaixo.
-    PORT=8000 \
+    PORT=8080 \
     WORKERS=2 \
     THREADS=4 \
     TIMEOUT=120
