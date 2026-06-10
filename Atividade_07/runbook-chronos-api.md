@@ -1,23 +1,17 @@
 # Runbook — Chronos API
-**Namespace:** `production` | **Cluster:** EKS | **Canal de plantão:** `#oncall-chronos`
+**Namespace:** `production` | **Repositório:** `hvt/chronos-api` | **Canal de plantão:** `#oncall-chronos`
 
 ---
 
-## Pré-requisitos
+## Índice
 
-| Ferramenta | Versão mínima | Finalidade |
-|---|---|---|
-| `kubectl` | 1.28+ | Gerenciamento do cluster |
-| `aws cli` | 2.x | Acesso a recursos AWS (SQS, CloudWatch) |
-| `argocd cli` | 2.x | Verificação de estado do deploy |
-
-Confirme acesso antes de iniciar qualquer intervenção:
-
-```bash
-kubectl auth can-i get pods -n production
-argocd app list
-aws sts get-caller-identity
-```
+1. [Verificar o Alerta](#1-verificar-o-alerta)
+2. [Acessar o Ambiente Kubernetes](#2-acessar-o-ambiente-kubernetes)
+3. [Listar Logs do Chronos API](#3-listar-logs-do-chronos-api)
+4. [Avaliar a Causa Raiz](#4-avaliar-a-causa-raiz)
+   - 4.1 [Avaliar Necessidade de Escalação](#41-avaliar-necessidade-de-escalação)
+5. [Aplicar Correções](#5-aplicar-correções)
+   - 5.1 [Avaliar Encerramento do Caso](#51-avaliar-encerramento-do-caso)
 
 ---
 
@@ -25,408 +19,452 @@ aws sts get-caller-identity
 
 ### 1.1 Identificar a origem
 
-Verifique o alerta no Grafana ou no canal `#oncall-chronos`:
+Alertas do Chronos chegam por três canais principais:
 
-- **Grafana:** Dashboard `Chronos API` → painel `Error Rate / Latency / Pod Health`
-- **Beacon (logs centralizados):** filtre por `service=chronos-api` e `level=error`
-
-### 1.2 Categorias de alerta mais comuns
-
-| Alerta | Possível causa | Prioridade |
+| Canal | Ferramenta | O que verificar |
 |---|---|---|
-| `HighErrorRate5xx` | Falha na aplicação / dependência | P1 |
-| `PodCrashLooping` | OOM, misconfiguration, startup probe | P1 |
-| `HPAMaxReplicasReached` | Pico de carga / memory leak | P2 |
-| `SQSConsumerLag` | Reactor indisponível ou lento | P2 |
-| `PostgresConnectionError` | Ledger inacessível ou pool esgotado | P1 |
-| `DeploymentProgressing` | Rollout travado no Argo CD | P2 |
+| Grafana | Dashboard `chronos-api` | Gráficos de latência, error rate, saturação |
+| Beacon | Logs centralizados | Mensagens de erro, stack traces, padrões recentes |
+| Kubernetes / HPA | `kubectl` | Estado dos pods, eventos de escalonamento |
 
-### 1.3 Coletar metadados do alerta
+### 1.2 Classificar a severidade
 
-Anote antes de prosseguir:
+Antes de agir, responda:
 
+- **O que está falhando?** (endpoint, worker, dependência)
+- **Desde quando?** (início do alerta vs. último deploy)
+- **Qual o impacto?** (usuários afetados, degradação parcial ou indisponibilidade total)
+- **Houve mudança recente?** (deploy no Argo CD, alteração em infra)
+
+### 1.3 Conferir o último deploy no Argo CD
+
+```bash
+argocd app get chronos-api
+argocd app history chronos-api
 ```
-- Nome do alerta:
-- Horário de início:
-- Labels (pod, node, region):
-- Threshold disparado:
-```
+
+Verifique se o status é `Healthy` e `Synced`. Se houver `Degraded` ou `OutOfSync`, anote o timestamp do último sync.
 
 ---
 
 ## 2. Acessar o Ambiente Kubernetes
 
-### 2.1 Configurar contexto do cluster EKS
+### 2.1 Configurar contexto EKS
 
 ```bash
-# Atualizar kubeconfig para o cluster correto
-aws eks update-kubeconfig --name <CLUSTER_NAME> --region <AWS_REGION>
+# Atualizar kubeconfig para o cluster EKS
+aws eks update-kubeconfig --region <REGION> --name <CLUSTER_NAME>
 
 # Confirmar contexto ativo
 kubectl config current-context
 ```
 
-### 2.2 Verificar saúde geral do namespace
+### 2.2 Verificar estado geral da aplicação
 
 ```bash
-# Visão geral dos recursos em production
-kubectl get all -n production
+# Listar todos os pods do Chronos
+kubectl get pods -n production -l app=chronos-api
 
-# Status dos pods do Chronos
+# Verificar detalhes dos pods (status, restarts, age)
 kubectl get pods -n production -l app=chronos-api -o wide
 
-# Estado do Deployment e HPA
-kubectl get deployment chronos-api -n production
-kubectl get hpa chronos-api -n production
+# Verificar o HPA (escalonamento horizontal)
+kubectl get hpa -n production chronos-api
+kubectl describe hpa -n production chronos-api
 ```
 
-### 2.3 Inspecionar eventos recentes
+**O que observar no HPA:**
+
+| Campo | Sinal de problema |
+|---|---|
+| `REPLICAS` próximo a `MAXPODS` (12) | Possível gargalo de CPU/memória |
+| `TARGETS` de CPU acima de 70% | Carga acima do threshold configurado |
+| `CONDITIONS` com `AbleToScale: False` | Problema no escalonamento |
+
+### 2.3 Verificar eventos recentes do namespace
 
 ```bash
-# Eventos do namespace (últimas ocorrências primeiro)
-kubectl get events -n production --sort-by='.lastTimestamp' | grep -i chronos
+kubectl get events -n production --sort-by='.lastTimestamp' | grep chronos-api | tail -30
+```
 
-# Detalhes de um pod específico (substitua <POD_NAME>)
+### 2.4 Verificar os pods com problemas
+
+```bash
+# Pods em CrashLoopBackOff, OOMKilled, Pending, etc.
+kubectl get pods -n production -l app=chronos-api --field-selector=status.phase!=Running
+
+# Descrever um pod específico para ver eventos e condições
 kubectl describe pod <POD_NAME> -n production
 ```
 
 ---
 
-## 3. Listar os Logs do Chronos API
+## 3. Listar Logs do Chronos API
 
-### 3.1 Logs via kubectl (tempo real)
+### 3.1 Logs em tempo real (kubectl)
 
 ```bash
-# Todos os pods do Chronos (label selector)
-kubectl logs -n production -l app=chronos-api --tail=200 --prefix
+# Logs de todos os pods simultaneamente
+kubectl logs -n production -l app=chronos-api --all-containers --prefix --timestamps -f
 
-# Pod específico com follow
-kubectl logs -n production <POD_NAME> --tail=500 -f
+# Logs de um pod específico
+kubectl logs -n production <POD_NAME> --timestamps -f
 
-# Pod em CrashLoop — logs do container anterior
-kubectl logs -n production <POD_NAME> --previous --tail=300
+# Logs das últimas 2 horas
+kubectl logs -n production <POD_NAME> --since=2h --timestamps
 
-# Filtrar apenas erros no terminal
-kubectl logs -n production -l app=chronos-api --tail=500 | grep -iE "error|exception|fatal|panic"
+# Logs de pod que reiniciou (container anterior)
+kubectl logs -n production <POD_NAME> --previous --timestamps
 ```
 
-### 3.2 Logs via PromQL / Loki no Grafana
+### 3.2 Consultas PromQL — métricas expostas em `/metrics`
 
-> Use o datasource **Loki** no Grafana ou a CLI do Beacon para as queries abaixo.
-
-**Erros críticos nos últimos 15 minutos:**
-
-```logql
-{namespace="production", app="chronos-api"} |= "error" | json | level="error"
-```
-
-**Rastrear um trace_id específico:**
-
-```logql
-{namespace="production", app="chronos-api"} | json | trace_id="<TRACE_ID>"
-```
-
-**Volume de erros por pod (agregado):**
-
-```logql
-sum by (pod) (
-  count_over_time(
-    {namespace="production", app="chronos-api"} |= "error" [5m]
-  )
-)
-```
-
-**Erros de conexão com Ledger (PostgreSQL):**
-
-```logql
-{namespace="production", app="chronos-api"} |= "postgres" |~ "connection|timeout|refused"
-```
-
-**Erros de conexão com Reactor (SQS):**
-
-```logql
-{namespace="production", app="chronos-api"} |= "sqs" |~ "error|timeout|throttl"
-```
-
-### 3.3 Métricas via PromQL no Grafana
-
-**Taxa de erros HTTP 5xx:**
+Use estas queries no Grafana (datasource Prometheus) para correlacionar com os logs.
 
 ```promql
-sum(rate(http_requests_total{namespace="production", app="chronos-api", status=~"5.."}[5m]))
-/
-sum(rate(http_requests_total{namespace="production", app="chronos-api"}[5m]))
+# Taxa de erros HTTP 5xx nos últimos 5 minutos
+sum(rate(http_requests_total{app="chronos-api", status=~"5.."}[5m])) by (pod)
+
+# Taxa total de requisições por status
+sum(rate(http_requests_total{app="chronos-api"}[5m])) by (status, pod)
+
+# Latência p95 por endpoint
+histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{app="chronos-api"}[5m])) by (le, handler))
+
+# Uso de CPU por pod
+sum(rate(container_cpu_usage_seconds_total{namespace="production", container="chronos-api"}[5m])) by (pod)
+
+# Uso de memória por pod
+container_memory_working_set_bytes{namespace="production", container="chronos-api"}
+
+# Pods em CrashLoopBackOff
+kube_pod_container_status_waiting_reason{namespace="production", reason="CrashLoopBackOff"} == 1
+
+# Número de reinicializações de containers
+kube_pod_container_status_restarts_total{namespace="production", pod=~"chronos-api.*"}
+
+# Disponibilidade do HPA vs réplicas desejadas
+kube_horizontalpodautoscaler_status_current_replicas{namespace="production", horizontalpodautoscaler="chronos-api"}
+kube_horizontalpodautoscaler_status_desired_replicas{namespace="production", horizontalpodautoscaler="chronos-api"}
 ```
 
-**Latência p99 por endpoint:**
+### 3.3 Logs no Beacon (LogQL / Loki)
 
-```promql
-histogram_quantile(0.99,
-  sum by (le, handler) (
-    rate(http_request_duration_seconds_bucket{namespace="production", app="chronos-api"}[5m])
-  )
-)
-```
+Se o Beacon utiliza Loki como backend, use as queries abaixo:
 
-**Pods em estado não-Ready:**
+```logql
+# Todos os logs de erro do Chronos
+{app="chronos-api", namespace="production"} |= "ERROR"
 
-```promql
-kube_pod_status_ready{namespace="production", pod=~"chronos-api.*", condition="true"} == 0
-```
+# Filtrar por stack trace de exceção
+{app="chronos-api", namespace="production"} |= "Exception" | json
 
-**Uso de CPU vs target do HPA:**
+# Logs de erro nos últimos 30 minutos
+{app="chronos-api", namespace="production", level="error"} [30m]
 
-```promql
-rate(container_cpu_usage_seconds_total{namespace="production", container="chronos-api"}[2m])
-```
+# Erros de conexão com dependências (Ledger/Reactor)
+{app="chronos-api", namespace="production"} |= "connection refused" or "timeout" or "SQS" or "PostgreSQL"
 
-**Réplicas ativas vs desejadas:**
-
-```promql
-kube_deployment_status_replicas_available{namespace="production", deployment="chronos-api"}
+# Taxa de logs de erro por pod
+sum by (pod) (rate({app="chronos-api", namespace="production", level="error"}[5m]))
 ```
 
 ---
 
 ## 4. Avaliar a Causa Raiz
 
-Siga a árvore de decisão abaixo para identificar a categoria do problema:
+### 4.1 Árvore de diagnóstico
+
+Use o fluxo abaixo para identificar a categoria do problema:
 
 ```
 Alerta disparado
 │
-├── Pods em CrashLoop / Not Ready?
-│   ├── SIM → ver seção 4.1 (falha no pod)
-│   └── NÃO ↓
+├─► Pods em CrashLoopBackOff / OOMKilled?
+│       └─► Ver seção 5.1 — Reinicialização / OOM
 │
-├── Alta taxa de erro 5xx?
-│   ├── SIM → ver seção 4.2 (erro de aplicação)
-│   └── NÃO ↓
+├─► Pods Pending (não sobem)?
+│       └─► Verificar recursos do cluster (nodes, taints, limites de namespace)
 │
-├── Latência elevada?
-│   ├── SIM → ver seção 4.3 (degradação de dependência)
-│   └── NÃO ↓
+├─► Pods Running mas com alta latência / erros 5xx?
+│       ├─► Dependência Ledger (PostgreSQL) indisponível? → Ver seção 5.3
+│       ├─► Dependência Reactor (SQS) com falha? → Ver seção 5.4
+│       └─► Problema na própria aplicação → Ver seção 5.2
 │
-└── HPA no máximo / deploy travado?
-    └── SIM → ver seção 4.4 (capacidade / rollout)
+└─► HPA no limite máximo (12 réplicas)?
+        └─► Investigar gargalo de CPU ou memory leak → Ver seção 5.5
 ```
 
-### 4.1 Falha no Pod (CrashLoop / OOMKilled)
+### 4.2 Verificar dependências externas
+
+**Ledger — PostgreSQL:**
 
 ```bash
-# Verificar motivo do restart
-kubectl describe pod <POD_NAME> -n production | grep -A 10 "Last State"
+# Verificar se o pod do Ledger está saudável
+kubectl get pods -n production -l app=ledger
 
-# Verificar se é OOMKilled
-kubectl get pod <POD_NAME> -n production -o jsonpath='{.status.containerStatuses[0].lastState.terminated.reason}'
+# Testar conectividade a partir de um pod do Chronos
+kubectl exec -n production <CHRONOS_POD> -- nc -zv <LEDGER_SERVICE> 5432
 
-# Verificar resource limits configurados
-kubectl get pod <POD_NAME> -n production -o jsonpath='{.spec.containers[0].resources}'
+# Verificar logs de conexão com banco
+kubectl logs -n production <CHRONOS_POD> --timestamps | grep -i "postgres\|ledger\|connection\|pool"
 ```
 
-**Sinais:**
-- `OOMKilled` → memory limit muito baixo ou vazamento de memória
-- `Error` / `CreateContainerError` → erro de configuração (secret, configmap, imagem)
-- `ImagePullBackOff` → tag de imagem inválida ou credencial ECR expirada
+```promql
+# Latência de queries ao banco (se instrumentado)
+histogram_quantile(0.99, rate(db_query_duration_seconds_bucket{app="chronos-api"}[5m]))
 
-### 4.2 Erro de Aplicação (5xx)
-
-```bash
-# Verificar endpoints disponíveis
-kubectl get endpoints chronos-api -n production
-
-# Acessar o /metrics diretamente para snapshot
-kubectl exec -n production <POD_NAME> -- curl -s http://localhost:<PORT>/metrics | grep http_requests
+# Erros de banco
+rate(db_errors_total{app="chronos-api"}[5m])
 ```
 
-**Sinais nos logs:**
-- Stack traces recorrentes em Java/Go/Node → bug na aplicação
-- `connection refused` para Ledger → PostgreSQL indisponível
-- `timeout` para Reactor → SQS com consumo lento ou throttling
-
-### 4.3 Degradação de Dependência
+**Reactor — SQS:**
 
 ```bash
-# Verificar conectividade com o Ledger (PostgreSQL)
-kubectl exec -n production <POD_NAME> -- nc -zv <LEDGER_SERVICE> 5432
-
-# Verificar fila SQS pelo AWS CLI
+# Verificar filas SQS via AWS CLI
 aws sqs get-queue-attributes \
   --queue-url <QUEUE_URL> \
-  --attribute-names ApproximateNumberOfMessages,ApproximateNumberOfMessagesNotVisible
+  --attribute-names All
 
-# Verificar se o serviço do Ledger está respondendo no cluster
-kubectl get svc -n production | grep ledger
-kubectl get endpoints -n production | grep ledger
+# Verificar número de mensagens na fila (possível acúmulo)
+aws sqs get-queue-attributes \
+  --queue-url <QUEUE_URL> \
+  --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible
+
+# Logs do Chronos relacionados ao SQS
+kubectl logs -n production <CHRONOS_POD> --timestamps | grep -i "sqs\|reactor\|queue\|consumer"
 ```
 
-### 4.4 Capacidade / Rollout Travado
+### 4.3 Verificar estado do Argo CD
 
 ```bash
-# Status detalhado do HPA
-kubectl describe hpa chronos-api -n production
+# Status completo da aplicação
+argocd app get chronos-api --output json | jq '.status'
 
-# Estado do rollout no Argo CD
-argocd app get chronos-api
-argocd app history chronos-api
+# Listar recursos gerenciados
+argocd app resources chronos-api
 
-# Verificar se há rollout travado
-kubectl rollout status deployment/chronos-api -n production
+# Verificar se há diff entre Git e cluster
+argocd app diff chronos-api
+```
+
+---
+
+### 4.1 Avaliar Necessidade de Escalação
+
+| Condição | Ação |
+|---|---|
+| Falha em **Ledger (PostgreSQL)** | Escalar para o time do Ledger via `#oncall-ledger` |
+| Falha em **Reactor (SQS)** ou problema AWS | Escalar para o time da plataforma / AWS support |
+| Bug de aplicação confirmado nos logs | Escalar para **@chronos-core** (SLA: 15 min horário comercial / 30 min fora) |
+| Problema de infra EKS (nodes, networking) | Escalar para time de plataforma/infraestrutura |
+| Incidente com impacto em usuários em produção | Abrir bridge de incidente + notificar gestão |
+
+**Template de escalação para o Slack:**
+
+```
+@chronos-core 🚨 Escalação Chronos API — <RESUMO DO PROBLEMA>
+
+• Alerta: <NOME DO ALERTA>
+• Início: <TIMESTAMP>
+• Impacto: <DESCRIÇÃO DO IMPACTO>
+• Diagnóstico inicial: <O QUE FOI VERIFICADO>
+• Logs relevantes: <LINK BEACON OU TRECHO>
+• Métricas: <LINK GRAFANA>
+• Ações já tomadas: <LISTA>
 ```
 
 ---
 
 ## 5. Aplicar Correções
 
-> ⚠️ **Antes de qualquer ação destrutiva:** registre no canal `#oncall-chronos` o que será feito e por quê.
-
----
-
-### 5.1 Reiniciar Pods com CrashLoop
+### 5.1 Pods em CrashLoopBackOff
 
 ```bash
-# Reiniciar um pod específico
-kubectl delete pod <POD_NAME> -n production
+# 1. Obter logs do container que crashou
+kubectl logs -n production <POD_NAME> --previous --timestamps
 
-# Rollout restart em todos os pods (rolling, sem downtime)
+# 2. Descrever o pod para ver eventos e exit codes
+kubectl describe pod -n production <POD_NAME>
+
+# 3. Se for problema de configuração (env, secrets, configmap)
+kubectl get configmap -n production chronos-api-config -o yaml
+kubectl get secret -n production chronos-api-secret -o yaml | base64 -d  # com cautela
+
+# 4. Forçar rollout (recriar pods com a mesma versão)
 kubectl rollout restart deployment/chronos-api -n production
 
-# Acompanhar o rollout
+# 5. Acompanhar o rollout
 kubectl rollout status deployment/chronos-api -n production
 ```
 
----
-
-### 5.2 Corrigir OOMKilled — Ajustar Memory Limit
+### 5.2 Rollback via Argo CD (deploy problemático)
 
 ```bash
-# Verificar configuração atual de resources
-kubectl get deployment chronos-api -n production -o yaml | grep -A 10 resources
-
-# Editar inline (use com cuidado em produção)
-kubectl set resources deployment chronos-api \
-  -n production \
-  --limits=memory=1Gi \
-  --requests=memory=512Mi
-```
-
-> **Preferível:** atualizar o `values.yaml` no repositório `hvt/chronos-api` e deixar o Argo CD reconciliar.
-
----
-
-### 5.3 Forçar Rollback via Argo CD
-
-```bash
-# Verificar histórico de revisões
+# 1. Listar histórico de deploys
 argocd app history chronos-api
 
-# Rollback para revisão anterior (ex: ID 42)
-argocd app rollback chronos-api 42
+# 2. Reverter para revisão anterior (substituir <ID> pelo número desejado)
+argocd app rollback chronos-api <REVISION_ID>
 
-# Acompanhar sincronização
-argocd app wait chronos-api --health
+# 3. Confirmar que o rollback foi aplicado
+argocd app get chronos-api
+kubectl rollout status deployment/chronos-api -n production
 ```
 
----
-
-### 5.4 Escalar Manualmente as Réplicas (Sobrecarga Temporária)
+### 5.3 Falha de conexão com Ledger (PostgreSQL)
 
 ```bash
-# Escalar para além do mínimo do HPA temporariamente
-kubectl scale deployment chronos-api -n production --replicas=10
+# Verificar se o Service do Ledger está resolvendo
+kubectl exec -n production <CHRONOS_POD> -- nslookup ledger-service
 
-# Verificar distribuição dos pods nos nodes
-kubectl get pods -n production -l app=chronos-api -o wide
+# Verificar endpoints do service
+kubectl get endpoints -n production ledger-service
+
+# Se o Ledger estiver com pods com problema
+kubectl get pods -n production -l app=ledger
+kubectl describe pod -n production <LEDGER_POD>
+
+# Opção temporária: reiniciar pods do Chronos para limpar pool de conexões
+kubectl rollout restart deployment/chronos-api -n production
 ```
 
-> **Lembre-se:** o HPA vai sobrescrever essa escala manual assim que o ciclo de reconciliação ocorrer. Para escala persistente, ajuste `minReplicas` no manifesto.
-
----
-
-### 5.5 Corrigir Problema com Dependências (Ledger / Reactor)
-
-**Se o Ledger (PostgreSQL) estiver inacessível:**
+### 5.4 Falha no Reactor (SQS)
 
 ```bash
-# Verificar se o serviço existe e tem endpoints
-kubectl get svc,endpoints -n production | grep ledger
+# Verificar permissões IAM do Service Account do Chronos
+kubectl get serviceaccount -n production chronos-api -o yaml
 
-# Verificar secrets de conexão
-kubectl get secret -n production | grep ledger
-kubectl describe secret <LEDGER_SECRET> -n production
-```
+# Verificar se a IAM Role associada tem permissões na fila
+aws iam get-role-policy --role-name <ROLE_NAME> --policy-name <POLICY_NAME>
 
-**Se o Reactor (SQS) estiver com fila acumulada:**
-
-```bash
-# Purge da DLQ (somente se autorizado pelo owner)
-aws sqs purge-queue --queue-url <DLQ_URL>
-
-# Verificar consumers ativos
+# Verificar DLQ (Dead Letter Queue) — mensagens com falha
 aws sqs get-queue-attributes \
-  --queue-url <QUEUE_URL> \
-  --attribute-names All
+  --queue-url <DLQ_URL> \
+  --attribute-names ApproximateNumberOfMessages
+
+# Reprocessar mensagens da DLQ (se necessário e seguro)
+aws sqs start-message-move-task \
+  --source-arn <DLQ_ARN> \
+  --destination-arn <MAIN_QUEUE_ARN>
+```
+
+### 5.5 Alta utilização de CPU / HPA no limite
+
+```bash
+# Verificar uso atual de CPU/memória por pod
+kubectl top pods -n production -l app=chronos-api
+
+# Verificar nodes do cluster
+kubectl top nodes
+
+# Aumentar temporariamente o limite máximo do HPA (se necessário)
+kubectl patch hpa chronos-api -n production \
+  --type merge \
+  -p '{"spec":{"maxReplicas": 16}}'
+
+# Verificar se há memory leak — monitorar por alguns minutos
+watch -n 10 kubectl top pods -n production -l app=chronos-api
+
+# Forçar recriação dos pods para liberar memória (temporário)
+kubectl rollout restart deployment/chronos-api -n production
+```
+
+### 5.6 Escalonamento manual de réplicas (emergência)
+
+```bash
+# Aumentar réplicas manualmente (bypassa o HPA temporariamente)
+kubectl scale deployment/chronos-api -n production --replicas=10
+
+# IMPORTANTE: Restaurar o controle ao HPA após estabilização
+# O HPA voltará a gerenciar as réplicas automaticamente
+# Para forçar reset:
+kubectl patch hpa chronos-api -n production \
+  --type merge \
+  -p '{"spec":{"minReplicas": 4, "maxReplicas": 12}}'
 ```
 
 ---
 
-### 5.6 Forçar Sincronização no Argo CD
+### 5.1 Avaliar Encerramento do Caso
 
-Útil quando o deploy está em `OutOfSync` ou `Degraded`:
+Antes de encerrar o caso, confirme **todos** os itens abaixo:
 
-```bash
-# Sincronizar sem prune (mais seguro)
-argocd app sync chronos-api
+#### Checklist de encerramento
 
-# Sincronizar com prune (remove recursos órfãos)
-argocd app sync chronos-api --prune
+- [ ] **Aplicação estável:** Pods em `Running` sem reinicializações recentes
+  ```bash
+  kubectl get pods -n production -l app=chronos-api
+  ```
 
-# Hard refresh (ignora cache do Git)
-argocd app sync chronos-api --force
-```
+- [ ] **HPA normalizado:** Réplicas voltando ao range operacional (4–12)
+  ```bash
+  kubectl get hpa -n production chronos-api
+  ```
+
+- [ ] **Métricas saudáveis:** Error rate < 1%, latência dentro do SLO, CPU < 70%
+  ```promql
+  sum(rate(http_requests_total{app="chronos-api", status=~"5.."}[5m])) /
+  sum(rate(http_requests_total{app="chronos-api"}[5m]))
+  ```
+
+- [ ] **Logs limpos:** Sem novos erros críticos no Beacon nos últimos 15 minutos
+
+- [ ] **Dependências OK:** Ledger e Reactor respondendo normalmente
+
+- [ ] **Rollout completo:** Se houve reinício ou rollback, confirmar com:
+  ```bash
+  kubectl rollout status deployment/chronos-api -n production
+  ```
+
+- [ ] **Alterações manuais revertidas:** HPA, replicas e quaisquer patches temporários devem estar nos valores originais
+
+#### Post-mortem e registro
+
+Após encerrar o caso:
+
+1. **Registrar no canal** `#oncall-chronos`:
+   ```
+   ✅ Caso encerrado — Chronos API
+   • Duração: <INICIO> → <FIM>
+   • Causa raiz: <DESCRIÇÃO>
+   • Correção aplicada: <AÇÃO>
+   • Próximos passos: <MELHORIAS / TICKETS>
+   ```
+
+2. **Criar ticket de follow-up** para:
+   - Ajuste de alertas se houve falso positivo
+   - Melhoria de resiliência (retry, circuit breaker, timeout)
+   - Revisão de limites de recursos (requests/limits dos pods)
+   - Documentação de nova causa raiz identificada
+
+3. **Atualizar este runbook** se um novo cenário foi identificado.
 
 ---
 
-### 5.7 Corrigir ImagePullBackOff (Credenciais ECR)
+## Referência Rápida — Comandos Essenciais
 
 ```bash
-# Verificar erro de pull
-kubectl describe pod <POD_NAME> -n production | grep -A 5 "Failed"
-
-# Renovar token ECR manualmente
-aws ecr get-login-password --region <AWS_REGION> | \
-  kubectl create secret docker-registry ecr-creds \
-    --docker-server=<ACCOUNT_ID>.dkr.ecr.<AWS_REGION>.amazonaws.com \
-    --docker-username=AWS \
-    --docker-password=$(aws ecr get-login-password --region <AWS_REGION>) \
-    -n production --dry-run=client -o yaml | kubectl apply -f -
-```
-
----
-
-## Pós-Incidente
-
-Após a estabilização, execute obrigatoriamente:
-
-```bash
-# Confirmar que todos os pods estão Running e Ready
+# Saúde geral
 kubectl get pods -n production -l app=chronos-api
+kubectl get hpa -n production chronos-api
+kubectl top pods -n production -l app=chronos-api
 
-# Confirmar HPA dentro da faixa esperada
-kubectl get hpa chronos-api -n production
+# Logs rápidos
+kubectl logs -n production -l app=chronos-api --all-containers --prefix -f --since=30m
 
-# Verificar ausência de novos erros nos logs
-kubectl logs -n production -l app=chronos-api --tail=100 | grep -iE "error|exception|fatal"
+# Eventos
+kubectl get events -n production --sort-by='.lastTimestamp' | grep chronos | tail -20
+
+# Rollout restart
+kubectl rollout restart deployment/chronos-api -n production
+kubectl rollout status deployment/chronos-api -n production
+
+# Argo CD
+argocd app get chronos-api
+argocd app rollback chronos-api <REVISION_ID>
 ```
-
-Registre no canal `#oncall-chronos`:
-
-- [ ] Horário de início e fim do incidente
-- [ ] Causa raiz identificada
-- [ ] Ação aplicada
-- [ ] Link para o dashboard Grafana do período
-- [ ] Abertura de ticket de follow-up (se necessário)
 
 ---
 
-*Runbook mantido pelo time SRE — repositório `hvt/chronos-api` · Última revisão: 2026-05*
+*Última atualização: 2026-06 | Time: @chronos-core | Canal: #oncall-chronos*

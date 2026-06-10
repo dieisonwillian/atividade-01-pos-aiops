@@ -18,6 +18,8 @@ Entregue. Prompt, modelo, output e justificativa mostrando como Role, Input, Ste
 
 ## Justificativa
 
+Considerando o prompt, Foi definido quem executa, após passado o imput com todos as informações importante sobre o projeto, na sequencia os passos que devem ser feitos para exucução e por final foi solicitado que fosse gerado os comando para validação se está tudo em ordem, acredito que com isso cumpra os passos do protocolo RISE.
+
 
 ## Modelo
 Sommet 4.6
@@ -31,14 +33,16 @@ Dependências diretas: Ledger (PostgreSQL) e Reactor (filas SQS).
 Observabilidade: métricas expostas em /metrics, logs centralizados no Beacon, dashboards em Grafana.
 Ferramentas disponíveis para o plantão: kubectl, aws cli, argocd cli.
 Canal de plantão: #oncall-chronos no Slack.
-
+Time sênior de escalação: @chronos-core (SLA de resposta: 15 minutos em horário comercial, 30 fora).
 
 Criar um runbook em markdown para virar uma documentação, com os seguintes passos.
 1. Verificar o Alerta.
 2. Acessar o ambiente kubernetes.
 3. Aistar os logs do Chornos API que está acusando o alerta.
-4. Avaliar a cusa raiz.
+4. Avaliar a causa raiz.
+4.1. Avaliar se existe necessidade de escalar para outros times
 5. Aplicar correções.
+5.1. Avaliar para encerramento do caso.
 
 Use comando Kubectl, PronQL para logs e construa as possibilidade de correção.
 
